@@ -1,0 +1,1 @@
+# samsung-karnel-su-rom-ori
