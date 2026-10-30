@@ -1,0 +1,285 @@
+name: Build Kernel A05 6.6.89 (ROM ori) + BakaSU + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Repo source kernel"
+        default: "https://github.com/rsuntk/android_kernel_samsung_a05m-6.6"
+      kernel_commit:
+        description: "Commit source (default = 6.6.89, sama dengan ROM ori A055FXXSHDZF1)"
+        default: "f599cd4b93a4fe1bacb8d29e4b978b56f4a0fee0"
+      expected_sublevel:
+        description: "SUBLEVEL yang harus cocok. Build berhenti kalau beda."
+        default: "89"
+      bakasu_ref:
+        description: "Commit/tag BakaSU"
+        default: "d5e9e025b8b49155f8014684d64c91742b465f65"
+      susfs_repo:
+        description: "Repo SUSFS (branch gki-android15-6.6)"
+        default: "https://github.com/ShirkNeko/susfs4ksu"
+      susfs_ref:
+        description: "Commit SUSFS (v2.3.0)"
+        default: "ebf876e"
+      zeromount:
+        description: "Pasang driver ZeroMount VFS (supaya modul ZeroMount bisa memakai mode VFS tanpa mount)"
+        type: boolean
+        default: true
+      zeromount_ref:
+        description: "Commit Enginex0/Super-Builders (sumber patch 60_zeromount)"
+        default: "c2cb71614868fe742cbffee2b6f3126523432673"
+      config_mode:
+        description: "ori = config asli kernel ROM ori (stock_a05m.config), gki = gki_defconfig"
+        default: "ori"
+      defex:
+        description: "keep = DEFEX tetap menyala seperti stok (aman untuk boot), off = matikan DEFEX (kalau root diblokir)"
+        default: "keep"
+      localversion:
+        description: "Akhiran versi kernel (kosongkan untuk bawaan). Default = sama dengan uname ROM ori"
+        default: "-android15-8-abA055FXXSHDZF1-4k"
+      config_only:
+        description: "Hanya cek source, hook, dan config (beberapa menit), tanpa compile"
+        type: boolean
+        default: false
+      crc_strict:
+        description: "true = zip TIDAK dibuat kalau CRC simbol beda dari kernel stok"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    # Dikunci ke 24.04: runner "latest" yang lebih baru punya glibc baru yang membuat libbpf (alat host kernel) gagal compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout (skrip patch, config stok, tools)
+        uses: actions/checkout@v4
+
+      - name: Kosongkan disk runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install dependensi build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            clang-18 lld-18 llvm-18 dwarves cpio rsync lz4 xz-utils zip unzip \
+            python3 git curl ca-certificates openssl
+          clang-18 --version | head -1
+
+      - name: Ambil source kernel (satu commit saja)
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "${{ inputs.kernel_repo }}"
+          git fetch --depth=1 origin "${{ inputs.kernel_commit }}"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='source commit: %H %s'
+
+      - name: Cek versi kernel harus sama dengan ROM ori
+        working-directory: kernel
+        run: |
+          grep -m3 -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+          SUB=$(grep -m1 '^SUBLEVEL' Makefile | awk '{print $3}')
+          if [ "$SUB" != "${{ inputs.expected_sublevel }}" ]; then
+            echo "::error::SUBLEVEL $SUB tidak sama dengan ${{ inputs.expected_sublevel }}"; exit 1
+          fi
+
+      - name: Perbaiki libbpf (aman di glibc lama maupun baru)
+        working-directory: kernel
+        run: |
+          F=tools/lib/bpf/libbpf.c
+          if grep -q "next_path = strchr(s, ':');" "$F"; then
+            sed -i "s/next_path = strchr(s, ':');/next_path = (char *)strchr(s, ':');/" "$F"
+            grep -n "next_path = (char \*)strchr" "$F"
+          else
+            echo "baris libbpf tidak ditemukan, dilewati"
+          fi
+
+      - name: Tambah BakaSU (setup.sh)
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s -- "${{ inputs.bakasu_ref }}"
+          # setup.sh diam-diam pindah ke branch default kalau ref tidak ketemu, jadi dicek di sini
+          HEAD_SHA=$(git -C KernelSU rev-parse HEAD)
+          git -C KernelSU log -1 --format='BakaSU commit: %h %cd %s'
+          case "$HEAD_SHA" in
+            "${{ inputs.bakasu_ref }}"*) ;;
+            *) echo "::error::BakaSU tidak berada di ${{ inputs.bakasu_ref }} (sekarang $HEAD_SHA)"; exit 1 ;;
+          esac
+          ls -la drivers | grep -i kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+
+      - name: Pasang SUSFS (hook inline SUSFS)
+        run: |
+          git clone -b gki-android15-6.6 "${{ inputs.susfs_repo }}" susfs4ksu
+          git -C susfs4ksu checkout "${{ inputs.susfs_ref }}"
+          git -C susfs4ksu log -1 --format='SUSFS commit: %h %cd %s'
+          python3 -I patch_hooks.py "$GITHUB_WORKSPACE/kernel" --only-cert
+          python3 -I patch_susfs.py "$GITHUB_WORKSPACE/kernel" "$GITHUB_WORKSPACE/susfs4ksu"
+          grep -m1 "define SUSFS_VERSION" kernel/include/linux/susfs.h
+
+      - name: Pasang ZeroMount (driver VFS)
+        if: ${{ inputs.zeromount }}
+        run: |
+          mkdir sb && cd sb
+          git init -q
+          git remote add origin https://github.com/Enginex0/Super-Builders
+          git fetch --depth=1 origin "${{ inputs.zeromount_ref }}"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='Super-Builders commit: %h %cd %s'
+          cd ..
+          python3 -I patch_zeromount.py "$GITHUB_WORKSPACE/kernel" \
+            "$GITHUB_WORKSPACE/sb/android15-6.6/ReSukiSU/patches/60_zeromount-android15-6.6.patch"
+          ls -l kernel/fs/zeromount.c kernel/include/linux/zeromount.h
+
+      - name: Cek hook yang diminta BakaSU
+        working-directory: kernel
+        run: |
+          ok=1
+          for pair in ksu_handle_setresuid:kernel/sys.c ksu_handle_execveat:fs/exec.c \
+                      ksu_handle_faccessat:fs/open.c ksu_handle_sys_read:fs/read_write.c \
+                      ksu_handle_stat:fs/stat.c ksu_handle_sys_reboot:kernel/reboot.c \
+                      ksu_handle_input_handle_event:drivers/input/input.c; do
+            h=${pair%%:*}; f=${pair##*:}
+            if grep -q "$h" "$f"; then echo "OK     $h  ($f)"; else echo "HILANG $h  ($f)"; ok=0; fi
+          done
+          [ "$ok" = 1 ] || { echo "::error::Ada hook yang hilang, build pasti gagal"; exit 1; }
+
+      - name: Atur config (basis = config asli kernel ROM ori)
+        working-directory: kernel
+        run: |
+          if [ "${{ inputs.config_mode }}" = "gki" ]; then BASE=gki_defconfig; else BASE=a05m_ori_defconfig; fi
+          DEF=arch/arm64/configs/$BASE
+          echo "Config dasar: $BASE"
+          if [ "$BASE" = "a05m_ori_defconfig" ]; then
+            test -s "$GITHUB_WORKSPACE/stock_a05m.config" || { echo "::error::stock_a05m.config tidak ada di root repo"; exit 1; }
+            test -s "$GITHUB_WORKSPACE/stock_trusted_cert.pem" || { echo "::error::stock_trusted_cert.pem tidak ada di root repo"; exit 1; }
+            cp "$GITHUB_WORKSPACE/stock_a05m.config" "$DEF"
+          fi
+          # path signing key bawaan menunjuk ke mesin MTK, ganti ke default
+          sed -i '/^CONFIG_MODULE_SIG_KEY=/d' $DEF
+          {
+            echo ""
+            echo "# BakaSU + SUSFS"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "# CONFIG_KSU_MANUAL_HOOK is not set"
+            echo 'CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"'
+            if [ "${{ inputs.zeromount }}" = "true" ]; then echo "CONFIG_ZEROMOUNT=y"; fi
+            if [ "$BASE" = "a05m_ori_defconfig" ]; then
+              # percayai sertifikat penanda tangan modul vendor stok, supaya modul vendor ROM tetap lolos cek tanda tangan
+              echo "CONFIG_SYSTEM_TRUSTED_KEYS=\"$GITHUB_WORKSPACE/stock_trusted_cert.pem\""
+              if [ -n "${{ inputs.localversion }}" ]; then
+                echo "CONFIG_LOCALVERSION=\"${{ inputs.localversion }}\""
+                echo "# CONFIG_LOCALVERSION_AUTO is not set"
+              fi
+              if [ "${{ inputs.defex }}" = "off" ]; then echo "# CONFIG_SECURITY_DEFEX is not set"; fi
+            else
+              echo "# CONFIG_LOCALVERSION_AUTO is not set"
+              echo "# CONFIG_SECURITY_DEFEX is not set"
+              echo "# CONFIG_BLK_DEV_UBLK is not set"
+              echo "# CONFIG_IO_URING is not set"
+            fi
+          } >> $DEF
+          export ARCH=arm64 LLVM=-18 LLVM_IAS=1
+          make O=out $BASE
+          make O=out olddefconfig
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::KSU tidak aktif di .config"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "::error::KSU_SUSFS tidak aktif"; exit 1; }
+          if [ "${{ inputs.zeromount }}" = "true" ]; then
+            grep -q '^CONFIG_ZEROMOUNT=y' out/.config || { echo "::error::ZEROMOUNT tidak aktif di .config"; exit 1; }
+          fi
+          cp out/.config "$GITHUB_WORKSPACE/final.config"
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KSU_SUSFS_[A-Z_]+|KSU_MANUAL_HOOK|ZEROMOUNT|IO_URING|SECURITY_DEFEX|LOCALVERSION|SYSTEM_TRUSTED_KEYS)=' out/.config || true
+
+      - name: Bandingkan config final dengan config stok
+        if: ${{ inputs.config_mode != 'gki' }}
+        run: |
+          IGN=""
+          if [ "${{ inputs.defex }}" = "off" ]; then IGN='CONFIG_SECURITY_DEFEX'; fi
+          python3 -I tools/cmpconfig.py stock_a05m.config kernel/out/.config "$IGN"
+
+      - name: Build kernel
+        if: ${{ !inputs.config_only }}
+        working-directory: kernel
+        run: |
+          export ARCH=arm64 LLVM=-18 LLVM_IAS=1
+          if ! make O=out -j"$(nproc)" -k Image > ../build.log 2>&1; then
+            echo "=============== BUILD GAGAL: cuplikan error pertama ==============="
+            grep -n -m1 -B12 -A25 -E "error:|undefined (reference|symbol)|\*\*\* \[[^]]*\.(o|a)\]|fatal error|ERROR" ../build.log || true
+            echo "=============== 60 baris terakhir ==============="
+            tail -n 60 ../build.log
+            exit 1
+          fi
+          test -f out/arch/arm64/boot/Image
+          ls -l out/arch/arm64/boot/Image
+
+      - name: Cek CRC simbol vs kernel stok ROM ori
+        if: ${{ !inputs.config_only && inputs.config_mode != 'gki' }}
+        shell: bash
+        run: |
+          set +e
+          python3 -I tools/cekcrc.py kernel/out/arch/arm64/boot/Image stock_modver.json > crc.log 2>&1
+          RC=$?
+          cat crc.log
+          if [ $RC -ne 0 ]; then
+            if [ "${{ inputs.crc_strict }}" = "true" ]; then
+              echo "::error::CRC tidak cocok dengan kernel stok -> modul vendor akan ditolak dan HP gagal boot. Zip TIDAK dibuat."
+              exit 1
+            fi
+            echo "::warning::CRC tidak cocok dengan kernel stok (crc_strict=false, zip tetap dibuat)"
+          fi
+
+      - name: Bungkus zip AnyKernel3 (Image.gz, sama seperti kernel stok)
+        if: ${{ !inputs.config_only }}
+        run: |
+          KVER=$(make -s -C kernel O=out kernelrelease ARCH=arm64 LLVM=-18 2>/dev/null || echo unknown)
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+          echo "kernelrelease: $KVER"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          # kernel stok di boot.img memakai gzip; Image mentah hampir sebesar partisi boot (32 MiB)
+          gzip -9 -n -c kernel/out/arch/arm64/boot/Image > ak3/Image.gz
+          ls -l kernel/out/arch/arm64/boot/Image ak3/Image.gz
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 - Galaxy A05 (a05m) + BakaSU
+          properties() { '
+          kernel.string=Galaxy A05 kernel 6.6.89 + BakaSU + SUSFS + ZeroMount
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a05m
+          device.name2=SM-A055F
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          cd ak3 && zip -r9 "../A05-6.6.89-BakaSU-${KVER}.zip" . -x '*.git*' && cd ..
+          ls -la *.zip
+
+      - name: Upload hasil
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A05-6.6.89-BakaSU-kernel
+          include-hidden-files: true
+          path: |
+            A05-6.6.89-BakaSU-*.zip
+            kernel/out/arch/arm64/boot/Image
+            final.config
+            build.log
+            crc.log
+          if-no-files-found: warn
