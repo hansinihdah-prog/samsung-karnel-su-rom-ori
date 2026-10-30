@@ -11,8 +11,9 @@ Kernel 6.6 untuk **Samsung Galaxy A05 (SM-A055F / a05m)** yang memakai **ROM ori
 |---|---|
 | Build lewat GitHub Actions | ✅ Berhasil |
 | Kecocokan dengan kernel stok (CRC simbol) | ✅ 16.237 simbol cocok, 0 beda, 0 hilang |
-| Boot di HP | ⏳ Belum dikonfirmasi (isi bagian ini setelah diuji) |
-| Root, modul, SUSFS | ⏳ Belum diuji |
+| Boot di HP | ✅ Berhasil boot di SM-A055F firmware `A055FXXSHDZF1` |
+| Root (BakaSU) dan SUSFS | ✅ Berfungsi |
+| ZeroMount | ✅ Driver VFS terpasang di kernel. Modul ZeroMount perlu dipasang terpisah lewat manager |
 
 Pernah ada versi awal yang berhenti di logo Samsung. Penyebabnya sudah ditemukan dan diperbaiki, lihat bagian **Kenapa repo ini ada**.
 
@@ -24,6 +25,7 @@ Pernah ada versi awal yang berhenti di logo Samsung. Penyebabnya sudah ditemukan
 | Source kernel | [rsuntk/android_kernel_samsung_a05m-6.6](https://github.com/rsuntk/android_kernel_samsung_a05m-6.6), commit `f599cd4b93a4` |
 | Root | BakaSU `v4.2.0-rc3`, commit `d5e9e025`, mode SUSFS inline hook |
 | SUSFS | v2.3.0 (commit `ebf876e`, branch `gki-android15-6.6`) |
+| ZeroMount | Driver VFS dari [Enginex0/Super-Builders](https://github.com/Enginex0/Super-Builders) (patch `60_zeromount`), dipasang di atas SUSFS v2.3.0. Bisa dimatikan lewat pilihan `zeromount` |
 | Config | Config asli kernel ROM ori, diambil dari `boot.img` stok |
 | DEFEX | Dibiarkan menyala seperti stok |
 
@@ -75,6 +77,7 @@ Pilihan di workflow:
 | Pilihan | Fungsi |
 |---|---|
 | `config_only` | Hanya cek source, hook, dan config (beberapa menit), tanpa compile |
+| `zeromount` | `true` = pasang driver ZeroMount VFS (default). `false` = tanpa ZeroMount, sama seperti build sebelumnya |
 | `defex` | `keep` = DEFEX menyala seperti stok (default, aman untuk boot). `off` = matikan DEFEX kalau root diblokir |
 | `crc_strict` | `true` = zip tidak dibuat kalau CRC beda dari kernel stok (default) |
 | `config_mode` | `ori` = config ROM ori (default). `gki` = `gki_defconfig`, hanya untuk ROM custom |
@@ -88,6 +91,7 @@ Isi artifact: zip untuk flash, `Image` mentah, `final.config`, `build.log`, dan 
 .github/workflows/build.yml   workflow build
 patch_hooks.py                perbaikan sertifikat di source kernel
 patch_susfs.py                pasang SUSFS ke source (sudah disesuaikan untuk 6.6.89)
+patch_zeromount.py            pasang driver ZeroMount VFS di atas SUSFS
 stock_a05m.config             config asli kernel ROM ori
 stock_modver.json             tabel CRC simbol kernel ROM ori
 stock_trusted_cert.pem        sertifikat penanda tangan modul stok
